@@ -46,8 +46,21 @@ your outbound packets:
 
 Every selector installs **its own rule** (OR semantics): `--source 10.0.5.10
 --src-port 49` drops *all* packets from `10.0.5.10` **and** *all* packets
-with source port 49, whichever matches first. If you want to scope tightly,
-one selector is usually enough.
+with source port 49, whichever matches first. There is no AND-combination,
+so **pass exactly one selector per run** — pick the one whose scope you
+accept:
+
+- `--source <auth-ip>` when the auth server has a dedicated IP. It drops
+  every reply from that IP, including non-auth traffic, so don't use it
+  against an IP that also serves another dependency.
+- `--src-port <port>` when the auth IP is unknown or shared. It drops
+  replies with that source port from *any* host, so confirm no other
+  dependency answers on that port.
+
+The walkthrough below uses `--source` with dedicated auth-server IPs. If
+your auth server shares its IP with another dependency, scope the run to
+`--limit` test containers or schedule a maintenance window — don't stack
+selectors to "narrow" the match, because stacking widens it.
 
 Flag placement matters: `--duration`, `--protocol`, `--source`,
 `--destination`, `--src-port`, `--dst-port`, `--interface`, `--limit` all
@@ -68,6 +81,10 @@ live on the **`iptables` parent command**; the `loss` subcommand only takes
 | Global Catalog (AD) | TCP | 3268 | `--protocol tcp --src-port 3268` |
 | Global Catalog SSL (AD) | TCP | 3269 | `--protocol tcp --src-port 3269` |
 
+The walkthrough below uses `--source` only (see the blast-radius note
+above); the port selectors in this table are the single-selector
+alternative for when the auth IP is unknown.
+
 ## 3. Walkthrough: full blackhole
 
 Replace the IPs with your auth servers and `re2:^web-` with your target
@@ -78,11 +95,14 @@ behavior: median/p99 login latency, which credential path is used
 (remote auth vs cache vs local fallback), and what the logs look like.
 You need this to recognize "degraded".
 
-**Step 1 — dry run.** Verify targeting without touching traffic:
+**Step 1 — dry run.** Verify targeting without touching traffic. The dry run
+logs the planned targets and selector values — it does not print the exact
+per-rule iptables commands, so it cannot hand you the `-D` command for a
+rule that survives cleanup (see §6):
 
 ```bash
 pumba --dry-run iptables --duration 5m --protocol tcp \
-  --source 10.0.5.10 --src-port 49 \
+  --source 10.0.5.10 \
   loss --probability 1.0 re2:^web-
 ```
 
@@ -90,7 +110,7 @@ pumba --dry-run iptables --duration 5m --protocol tcp \
 
 ```bash
 pumba iptables --duration 5m --protocol tcp \
-  --source 10.0.5.10 --src-port 49 \
+  --source 10.0.5.10 \
   loss --probability 1.0 re2:^web-
 ```
 
@@ -98,7 +118,7 @@ pumba iptables --duration 5m --protocol tcp \
 
 ```bash
 pumba iptables --duration 5m --protocol udp \
-  --source 10.0.5.11 --src-port 1812,1813 \
+  --source 10.0.5.11 \
   loss --probability 1.0 re2:^vpn-gateway-
 ```
 
@@ -106,21 +126,25 @@ pumba iptables --duration 5m --protocol udp \
 
 ```bash
 pumba iptables --duration 5m --protocol tcp \
-  --source 10.0.5.12 --src-port 389,636 \
+  --source 10.0.5.12 \
   loss --probability 1.0 re2:^app-
 ```
 
 **Step 5 — Active Directory (Kerberos + Global Catalog).** Kerberos uses
-both TCP and UDP on port 88, so run the two variants back to back:
+both TCP and UDP on port 88, so both protocols must be blocked **at the
+same time** — running them back to back leaves one protocol open while the
+other is blocked. Launch both variants in the background so their windows
+overlap:
 
 ```bash
 pumba iptables --duration 5m --protocol tcp \
-  --source 10.0.5.13 --src-port 88,464,3268,3269 \
-  loss --probability 1.0 re2:^app-
+  --source 10.0.5.13 \
+  loss --probability 1.0 re2:^app- &
 
 pumba iptables --duration 5m --protocol udp \
-  --source 10.0.5.13 --src-port 88 \
-  loss --probability 1.0 re2:^app-
+  --source 10.0.5.13 \
+  loss --probability 1.0 re2:^app- &
+wait
 ```
 
 **Step 6 — partial outage.** A flapping server is nastier than a dead one.
@@ -128,7 +152,7 @@ Drop half the replies, or every 3rd packet:
 
 ```bash
 pumba iptables --duration 5m --protocol tcp \
-  --source 10.0.5.10 --src-port 49 \
+  --source 10.0.5.10 \
   loss --probability 0.5 re2:^web-
 ```
 
@@ -139,15 +163,37 @@ token, hit the endpoint that re-validates a session. Capture what happens.
 
 A blackhole is binary. Real outages are often *slow*: congested links,
 overloaded auth servers, cross-region latency spikes. Use `netem` for the
-degraded variant. Note that `netem` has **no port selectors** — it shapes
-all of the target container's traffic, so prefer a dedicated test instance
-or accept the wider blast radius.
+degraded variant. Unlike the doc's first draft, `netem` **does** accept
+filters — `--target`, `--egress-port`, and `--ingress-port` — but they match
+on the container's **egress** path (the tc qdisc shapes outbound packets),
+so plan the topology accordingly:
+
+| Flag | Matches (on egress) | Auth-topology use |
+|---|---|---|
+| `--target <ip\|CIDR\|container>` | packets **to** that destination (`match ip dst`) | `--target 10.0.5.10` degrades traffic bound for the auth server |
+| `--ingress-port <ports>` | outbound packets whose **destination** port matches (`match ip dport`) | `--ingress-port 49` degrades requests headed *to* the TACACS+ port |
+| `--egress-port <ports>` | outbound packets whose **source** port matches (`match ip sport`) | the client's source port is ephemeral, so this rarely selects auth traffic — only useful when pumba targets the auth server's own containers (its replies) |
+
+Limitations: inbound replies can't be selected by netem filters — you
+degrade the outbound *requests* instead. IPv6 `--target` values are not
+supported. Without filters, netem shapes all of the container's traffic, so
+prefer a dedicated test instance or accept the wider blast radius.
 
 **Slow auth (2.5s delay + 500ms jitter):**
 
 ```bash
 pumba --log-level=info netem --duration 5m \
   --tc-image ghcr.io/alexei-led/pumba-debian-nettools \
+  delay --time 2500 --jitter 500 re2:^web-
+```
+
+Scoped to traffic bound for the TACACS+ server (same effect, narrower
+blast radius):
+
+```bash
+pumba --log-level=info netem --duration 5m \
+  --tc-image ghcr.io/alexei-led/pumba-debian-nettools \
+  --target 10.0.5.10 --ingress-port 49 \
   delay --time 2500 --jitter 500 re2:^web-
 ```
 
@@ -192,27 +238,46 @@ Anything else is a finding. File it, fix it, re-run the rehearsal.
 
 - **Stage first.** Run the full rehearsal in a staging environment that
   mirrors production auth topology before touching anything shared.
-- **`--dry-run` is free.** It logs the planned iptables commands without
-  executing them. Use it every time you change selectors.
-- **`--duration` is your dead-man's switch.** When it elapses, pumba
-  issues the mirror `-D` command and removes the rules automatically —
-  even on abort. Keep durations short (minutes) and prefer several short
-  runs over one long one.
+- **`--dry-run` is free.** It logs the planned targets and selector values
+  without touching traffic — use it every time you change selectors. It
+  does not print the exact per-rule iptables commands, so it cannot hand
+  you the `-D` command for a rule that survived cleanup.
+- **`--duration` is your dead-man's switch — but it is not a guarantee.**
+  When it elapses (or you abort), pumba issues the mirror `-D` commands to
+  remove the rules, and it attempts cleanup on abort too. Cleanup failures
+  are logged as warnings only, and if rule installation fails partway
+  (e.g. one selector rule was inserted and a later one failed), pumba
+  returns without cleaning up. Treat the timer as a safety net, not a
+  promise: verify after every run, including ones that errored. Keep
+  durations short (minutes) and prefer several short runs over one long
+  one.
 - **Limit blast radius.** Scope targets tightly (`re2:^staging-web-`,
   not `re2:.*`) and use `--limit` to cap how many matching containers get
   hit. Never run a blackhole against the auth server's own containers —
   that takes the service down for real.
-- **Verify cleanup.** After each run, confirm the rules are gone inside a
-  target container before the next run:
+- **Verify cleanup.** After *every* run — including ones that errored —
+  confirm the rules are gone inside a target container before the next run:
 
   ```bash
   docker exec <target-container> iptables -S INPUT
   ```
 
   The output should match your pre-run baseline (take a snapshot of it
-  in Step 0). If a rule survived — e.g. pumba was killed ungracefully —
-  remove it with the matching `iptables -D INPUT …` command shown by
-  `--dry-run`.
+  in Step 0). If a rule survived — e.g. pumba was killed ungracefully or
+  installation failed partway — delete it based on what is actually
+  present, by mirroring the listed rule into a `-D` command:
+
+  ```bash
+  # listed rule:
+  #   -A INPUT -i eth0 -p tcp -s 10.0.5.10 -m statistic \
+  #     --mode random --probability 1.00 -j DROP
+  # is removed with:
+  docker exec <target-container> iptables -D INPUT -i eth0 -p tcp \
+    -s 10.0.5.10 -m statistic --mode random --probability 1.00 -j DROP
+  ```
+
+  (Don't copy a `-D` from `--dry-run` output — the dry run never prints the
+  per-rule commands.)
 - **Watch the auth server, not just the client.** An outage rehearsal can
   look like an attack from the server's side (connection storms on
   recovery). Coordinate with whoever owns the auth infrastructure.
