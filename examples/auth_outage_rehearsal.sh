@@ -107,11 +107,18 @@ announce_phase() {
 # fully clean phase; nonzero aborts the caller - a failed install, a lost
 # terminal, or a failed cleanup all stop the rehearsal, never cascade.
 run_phase() {
-  label="$1"; marker="$2"; verify_hint="$3"; exercise_lines="$4"; shift 4
+  # $5 is the conventional "--" separator between our args and the pumba
+  # command, so shift 5 to leave "$@" as the command to execute.
+  label="$1"; marker="$2"; verify_hint="$3"; exercise_lines="$4"; shift 5
   PUMBA_LOG="$(mktemp /tmp/auth-outage-rehearsal.XXXXXX.log)"
   "$@" >"$PUMBA_LOG" 2>&1 &
   PUMBA_PID=$!
   if ! announce_phase "$label" "$PUMBA_PID" "$PUMBA_LOG" "$marker"; then
+    # Install never verified: stop the backgrounded run before reporting
+    # failure. A slow-starting pumba (e.g. pulling the tc sidecar image)
+    # could otherwise install the disruption after we give up and leave
+    # it running unsupervised until --duration expires.
+    stop_phase "$PUMBA_PID" 2>/dev/null || true
     PUMBA_PID=""
     rm -f "$PUMBA_LOG"
     return 1
