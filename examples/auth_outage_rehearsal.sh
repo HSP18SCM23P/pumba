@@ -117,8 +117,12 @@ run_phase() {
     # Install never verified: stop the backgrounded run before reporting
     # failure. A slow-starting pumba (e.g. pulling the tc sidecar image)
     # could otherwise install the disruption after we give up and leave
-    # it running unsupervised until --duration expires.
-    stop_phase "$PUMBA_PID" 2>/dev/null || true
+    # it running unsupervised until --duration expires. If the stop
+    # itself errors, say so: a rule or qdisc may have survived, and the
+    # operator must verify before re-running.
+    if ! stop_phase "$PUMBA_PID" 2>/dev/null; then
+      echo "warning: stopping the failed '${label}' phase reported an error - ${verify_hint} to confirm no rules/qdisc were left behind before re-running" >&2
+    fi
     PUMBA_PID=""
     rm -f "$PUMBA_LOG"
     return 1
