@@ -24,10 +24,12 @@
 #   AUTH_PORTS  comma-separated service ports, for reference    (default: 49)
 #               TACACS+ 49 | RADIUS 1812,1813 | LDAP 389,636
 #               AD Kerberos 88 | kpasswd 464 | GC 3268,3269
-#               Shown in the plan line only: the runs scope with --source
-#               alone, because every selector installs its own DROP rule
-#               (OR semantics) - stacking --source with --src-port would
-#               widen the blast radius, not narrow it.
+#               Shown in the plan line only: the iptables runs scope with
+#               --source alone, because every selector installs its own
+#               DROP rule (OR semantics) - stacking --source with
+#               --src-port would widen the blast radius, not narrow it.
+#               Same for netem: each filter flag installs its own tc
+#               filter, so the netem phases use --target alone.
 #   TARGET      target containers (name or re2: regex)           (default: re2:^web-)
 #   DURATION    how long each chaos phase lasts                   (default: 5m)
 #   TC_IMAGE    netem sidecar image                               (default: ghcr.io/alexei-led/pumba-debian-nettools)
@@ -49,11 +51,87 @@ abort() {
   exit 1
 }
 
+# Signal safety: Ctrl-C (SIGINT) or SIGTERM during a phase stops the
+# backgrounded pumba run instead of orphaning the disruption until
+# --duration expires. PUMBA_PID is cleared after every clean stop so the
+# trap never touches a stale pid.
+PUMBA_PID=""
+on_signal() {
+  if [ -n "$PUMBA_PID" ]; then
+    kill "$PUMBA_PID" 2>/dev/null || true
+    wait "$PUMBA_PID" 2>/dev/null || true
+    PUMBA_PID=""
+  fi
+  exit 130
+}
+trap on_signal INT TERM
+
 # stop_phase <pid>: end a backgrounded pumba run; pumba removes its
-# rules/qdisc on stop (SIGTERM -> abort path -> cleanup).
+# rules/qdisc on stop (SIGTERM -> abort path -> cleanup). Returns pumba's
+# exit status: 0 on a clean stop (cleanup reported OK), nonzero when the
+# run or its cleanup errored. A nonzero return means disruption may still
+# be installed - callers must NOT proceed to the next phase.
 stop_phase() {
   kill "$1" 2>/dev/null || true
-  wait "$1" 2>/dev/null || true
+  wait "$1"
+}
+
+# announce_phase <label> <pid> <log> <marker>: after a grace window,
+# confirm the disruption is really installed before announcing it:
+# the pumba process must still be alive and its log must show the
+# per-container install marker. Returns 0 when installed, 1 with the
+# log tail otherwise - a phase is never declared active on a dead or
+# silent pumba run.
+announce_phase() {
+  label="$1"; pid="$2"; logfile="$3"; marker="$4"
+  sleep 5
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "phase '${label}' failed: pumba exited before installing - log tail:" >&2
+    tail -20 "$logfile" >&2
+    return 1
+  fi
+  if ! grep -q "$marker" "$logfile" 2>/dev/null; then
+    echo "phase '${label}' failed: pumba is alive but never reported install - log tail:" >&2
+    tail -20 "$logfile" >&2
+    return 1
+  fi
+  echo ""
+  echo "${label} is ACTIVE. Exercise logins NOW, while the disruption is in place:"
+  return 0
+}
+
+# run_phase <label> <install-marker> <verify-hint> <exercise-lines> -- <pumba args...>
+# Full lifecycle of one chaos phase: start pumba in the background with
+# its log captured, verify install before announcing, hold an interactive
+# window for login exercise, then stop and verify cleanup. Returns 0 on a
+# fully clean phase; nonzero aborts the caller - a failed install, a lost
+# terminal, or a failed cleanup all stop the rehearsal, never cascade.
+run_phase() {
+  label="$1"; marker="$2"; verify_hint="$3"; exercise_lines="$4"; shift 4
+  PUMBA_LOG="$(mktemp /tmp/auth-outage-rehearsal.XXXXXX.log)"
+  "$@" >"$PUMBA_LOG" 2>&1 &
+  PUMBA_PID=$!
+  if ! announce_phase "$label" "$PUMBA_PID" "$PUMBA_LOG" "$marker"; then
+    PUMBA_PID=""
+    rm -f "$PUMBA_LOG"
+    return 1
+  fi
+  echo "$exercise_lines"
+  echo "Press enter when done (phase ends on its own after ${DURATION})"
+  if ! read -r _; then
+    stop_phase "$PUMBA_PID" 2>/dev/null || true
+    PUMBA_PID=""
+    rm -f "$PUMBA_LOG"
+    abort "lost input - phase stopped"
+  fi
+  if ! stop_phase "$PUMBA_PID"; then
+    PUMBA_PID=""
+    rm -f "$PUMBA_LOG"
+    abort "phase cleanup reported an error - disruption may still be installed; ${verify_hint} and clean up manually before re-running"
+  fi
+  PUMBA_PID=""
+  rm -f "$PUMBA_LOG"
+  return 0
 }
 
 echo "Rehearsal plan: drop ${AUTH_PROTO}/${AUTH_PORTS} replies from ${AUTH_IP}"
@@ -76,21 +154,14 @@ read -r reply || abort "no confirmation received (stdin not interactive?)"
 # so --source selects the auth server's *replies*, which is what makes the
 # dependency look unreachable to the container. A single selector only:
 # --source and --src-port would each install their own DROP rule.
-pumba --log-level=info iptables --duration "$DURATION" --protocol "$AUTH_PROTO" \
-  --source "$AUTH_IP" \
-  loss --probability 1.0 "$TARGET" &
-PUMBA_PID=$!
-sleep 5
-
-echo ""
-echo "Blackhole is ACTIVE. Exercise logins NOW, while the rules are in place:"
-echo "  - fresh login, token rotation, session re-validation"
-echo "Press enter when done (phase ends on its own after ${DURATION})"
-if ! read -r _; then
-  stop_phase "$PUMBA_PID"
-  abort "lost input - phase stopped"
+if ! run_phase "Blackhole" "running iptables on container" \
+  "verify with: docker exec <target-container> iptables -S INPUT" \
+  "  - fresh login, token rotation, session re-validation" \
+  -- pumba --log-level=info iptables --duration "$DURATION" --protocol "$AUTH_PROTO" \
+    --source "$AUTH_IP" \
+    loss --probability 1.0 "$TARGET"; then
+  abort "blackhole phase failed - fix the error above and re-run"
 fi
-stop_phase "$PUMBA_PID"
 
 echo "Blackhole phase done. Verify cleanup inside a target container:"
 echo "  docker exec <target-container> iptables -S INPUT"
@@ -101,45 +172,35 @@ read -r reply || abort "no confirmation received - stopping"
 [ "$reply" = "yes" ] || abort "not confirmed"
 
 # Phase 2: degraded path - 2.5s delay + 500ms jitter.
-# --target/--ingress-port scope the delay to traffic bound for the auth
-# server (egress filters; inbound replies can't be selected by netem).
-pumba --log-level=info netem --duration "$DURATION" --tc-image "$TC_IMAGE" \
-  --target "$AUTH_IP" --ingress-port "$AUTH_PORTS" \
-  delay --time 2500 --jitter 500 "$TARGET" &
-PUMBA_PID=$!
-sleep 5
-
-echo ""
-echo "Slow-auth phase is ACTIVE. Exercise logins NOW, while the delay applies:"
-echo "  - note p50/p99 latency, timeouts, fallback behavior"
-echo "Press enter when done (phase ends on its own after ${DURATION})"
-if ! read -r _; then
-  stop_phase "$PUMBA_PID"
-  abort "lost input - phase stopped"
+# --target scopes the delay to traffic bound for the auth server (an egress
+# filter: inbound replies can't be selected by netem). A single filter only:
+# each flag installs its own tc filter (OR semantics), so adding
+# --ingress-port alongside --target would ALSO degrade traffic to the auth
+# port on every other host - widening the blast radius, not narrowing it.
+if ! run_phase "Slow-auth phase" "running netem on container" \
+  "verify with: docker exec <target-container> tc qdisc show" \
+  "  - note p50/p99 latency, timeouts, fallback behavior" \
+  -- pumba --log-level=info netem --duration "$DURATION" --tc-image "$TC_IMAGE" \
+    --target "$AUTH_IP" \
+    delay --time 2500 --jitter 500 "$TARGET"; then
+  abort "slow-auth phase failed - fix the error above and re-run"
 fi
-stop_phase "$PUMBA_PID"
 
 echo ""
 echo "Type 'yes' for the flaky-auth variant (50% loss), anything else stops here"
 read -r reply || abort "no confirmation received - stopping"
 [ "$reply" = "yes" ] || abort "not confirmed"
 
-# Phase 3: degraded path - 50% packet loss, scoped to auth-bound traffic
-pumba --log-level=info netem --duration "$DURATION" --tc-image "$TC_IMAGE" \
-  --target "$AUTH_IP" --ingress-port "$AUTH_PORTS" \
-  loss --percent 50 "$TARGET" &
-PUMBA_PID=$!
-sleep 5
-
-echo ""
-echo "Flaky-auth phase is ACTIVE. Exercise logins NOW, while the loss applies:"
-echo "  - retries bounded with backoff, or unbounded hammering?"
-echo "Press enter when done (phase ends on its own after ${DURATION})"
-if ! read -r _; then
-  stop_phase "$PUMBA_PID"
-  abort "lost input - phase stopped"
+# Phase 3: degraded path - 50% packet loss, scoped to auth-bound traffic.
+# Same single-filter rule as Phase 2 (see comment there).
+if ! run_phase "Flaky-auth phase" "running netem on container" \
+  "verify with: docker exec <target-container> tc qdisc show" \
+  "  - retries bounded with backoff, or unbounded hammering?" \
+  -- pumba --log-level=info netem --duration "$DURATION" --tc-image "$TC_IMAGE" \
+    --target "$AUTH_IP" \
+    loss --percent 50 "$TARGET"; then
+  abort "flaky-auth phase failed - fix the error above and re-run"
 fi
-stop_phase "$PUMBA_PID"
 
 echo ""
 echo "Rehearsal complete. Post-run checks:"
