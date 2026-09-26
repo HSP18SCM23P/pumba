@@ -76,28 +76,33 @@ stop_phase() {
   wait "$1"
 }
 
-# announce_phase <label> <pid> <log> <marker>: after a grace window,
-# confirm the disruption is really installed before announcing it:
-# the pumba process must still be alive and its log must show the
-# per-container install marker. Returns 0 when installed, 1 with the
-# log tail otherwise - a phase is never declared active on a dead or
-# silent pumba run.
+# announce_phase <label> <pid> <log> <marker>: wait for the install marker,
+# confirming the disruption is really installed before announcing it:
+# the pumba process must stay alive and its log must show the
+# per-container install marker. Polls for up to ~60s (cold sidecar image
+# pulls are slow) instead of a single fixed sleep. Returns 0 when
+# installed, 1 with the log tail otherwise - a phase is never declared
+# active on a dead or silent pumba run.
 announce_phase() {
   label="$1"; pid="$2"; logfile="$3"; marker="$4"
-  sleep 5
-  if ! kill -0 "$pid" 2>/dev/null; then
-    echo "phase '${label}' failed: pumba exited before installing - log tail:" >&2
-    tail -20 "$logfile" >&2
-    return 1
-  fi
-  if ! grep -q "$marker" "$logfile" 2>/dev/null; then
-    echo "phase '${label}' failed: pumba is alive but never reported install - log tail:" >&2
-    tail -20 "$logfile" >&2
-    return 1
-  fi
-  echo ""
-  echo "${label} is ACTIVE. Exercise logins NOW, while the disruption is in place:"
-  return 0
+  tries=0
+  while [ "$tries" -lt 30 ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "phase '${label}' failed: pumba exited before installing - log tail:" >&2
+      tail -20 "$logfile" >&2
+      return 1
+    fi
+    if grep -q "$marker" "$logfile" 2>/dev/null; then
+      echo ""
+      echo "${label} is ACTIVE. Exercise logins NOW, while the disruption is in place:"
+      return 0
+    fi
+    tries=$((tries + 1))
+    sleep 2
+  done
+  echo "phase '${label}' failed: pumba is alive but never reported install - log tail:" >&2
+  tail -20 "$logfile" >&2
+  return 1
 }
 
 # run_phase <label> <install-marker> <verify-hint> <exercise-lines> -- <pumba args...>
@@ -130,7 +135,9 @@ run_phase() {
   echo "$exercise_lines"
   echo "Press enter when done (phase ends on its own after ${DURATION})"
   if ! read -r _; then
-    stop_phase "$PUMBA_PID" 2>/dev/null || true
+    if ! stop_phase "$PUMBA_PID" 2>/dev/null; then
+      echo "warning: stopping the phase after lost input reported an error - ${verify_hint} to confirm no rules/qdisc were left behind" >&2
+    fi
     PUMBA_PID=""
     rm -f "$PUMBA_LOG"
     abort "lost input - phase stopped"
