@@ -179,6 +179,14 @@ degrade the outbound *requests* instead. IPv6 `--target` values are not
 supported. Without filters, netem shapes all of the container's traffic, so
 prefer a dedicated test instance or accept the wider blast radius.
 
+**Each filter flag installs its own tc filter rule (OR semantics)** — one
+rule per `--target` value, per `--egress-port` port, per `--ingress-port`
+port, each matched independently against outbound packets. There is no
+AND-combination, so **pass exactly one filter per run** — the way the
+walkthrough's netem examples use `--target` alone. Combining flags widens
+the match: `--target 10.0.5.10 --ingress-port 49` degrades traffic bound
+for `10.0.5.10` **and** all outbound traffic to port 49 on any host.
+
 **Slow auth (2.5s delay + 500ms jitter):**
 
 ```bash
@@ -193,7 +201,7 @@ blast radius):
 ```bash
 pumba --log-level=info netem --duration 5m \
   --tc-image ghcr.io/alexei-led/pumba-debian-nettools \
-  --target 10.0.5.10 --ingress-port 49 \
+  --target 10.0.5.10 \
   delay --time 2500 --jitter 500 re2:^web-
 ```
 
